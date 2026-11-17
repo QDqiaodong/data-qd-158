@@ -1,0 +1,27 @@
+{
+  "cidr": "192.0.2.0/30",
+  "operations": [
+    {
+      "kind": "acquire",
+      "now": 0,
+      "client": "A",
+      "ttl": 10
+    },
+    {
+      "kind": "acquire",
+      "now": 0,
+      "client": "B",
+      "ttl": 20
+    },
+    {
+      "kind": "acquire",
+      "now": 10,
+      "client": "C",
+      "ttl": 5
+    },
+    {
+      "kind": "list",
+      "now": 20
+    }
+  ]
+}

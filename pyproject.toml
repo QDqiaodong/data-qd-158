@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "data-qd-158"
+version = "0.1.0"
+description = "Transactional bounded IPv4 lease allocation and expiry"
+requires-python = ">=3.11"
+dependencies = []
+[project.scripts]
+ipv4-leases = "ipv4_leases.cli:main"
+ipv4-admin = "ipv4_leases.admin:main"
+[tool.setuptools.packages.find]
+where = ["src"]
