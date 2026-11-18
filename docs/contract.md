@@ -67,3 +67,23 @@ JSON入口是隔离临时数据库中的可重现操作演示，输入cidr及ope
 **算法与终止**：选路用按前缀组织的二进制trie做最长前缀匹配，每个前缀节点预算该前缀的最小metric路由集。依赖图从池hosts出发、沿获选via惰性扩展（不枚举池外IPv4空间、不枚举递归路径），节点规模受路由数界定。接口标签在图的强连通分量（SCC）压缩DAG上求解：迭代式Kosaraju（无递归深度问题，支持1500层网关链）按拓扑逆序把每个SCC自身直连接口与所有可达后继SCC的标签取并，恰为最小不动点——纯环SCC无自身标签即空集，带出口的环继承全部可达出口。
 
 **输出**：API报告严格包含`cidr`、`clock`、`baseline`、`scenarios`。`baseline`覆盖全部可用hosts的最大连续闭区间，每项为`{start,end,interfaces}`；情景`changes`只列接口集合发生变化的最大连续闭区间，每项为`{start,end,before,after}`，区间按IPv4数值排序、不因路由id或前缀边界人为拆分等价区间，接口集合按Python字符串顺序排序，空数组表示不可达。每情景给出`changed_hosts`（集合改变）、`lost_hosts`（原非空后为空）、`recovered_hosts`（原为空后非空），均按区间内地址数累计而非路由或区间条数；`scenarios`按id排序。CLI在同一报告上增加`source_sha256`，原子保存完整JSON并在stdout打印相同内容，成功退出0。出错退出2并只向stderr说明原因，保留已有报告且不输出成功JSON；拒绝输入/输出/数据库指向同一路径，拒绝三者的符号链接；缺失或未初始化的池失败且不创建数据库。由于故障只撤路由、不增路由，基准为空的地址在任何情景下都不会变为非空，`recovered_hosts`在该语义下恒为0但计数分支仍按通用集合变化实现。
+
+## 离线有序ACL首命中差异审计（acl-diff）
+
+`Pool.acl_diff(before, after)` / `ipv4-admin --db DB acl-diff --source FILE --output FILE`在单个SQLite只读一致快照中只读取`cidr`与`clock`，对两版有序ACL策略做精确的首命中（first-hit）差异审计；全程离线、不访问真实网络，不推进clock、不清理到期租约或外部事实、不写入任何表，也不读取租约、外部占用或归属历史（无历史表的旧池同样可审计，且不调用旧list查询）。沿用/31、/32的hosts语义，源分析域始终只是本池的全部可用hosts，与当前租约、外部占用和归属历史无关。
+
+**分析域**：本池全部可用源hosts × 全部2^32个目标IPv4地址 × `{tcp,udp}` × 目标端口0..65535，无源端口维度；目标域不剔除任何network或broadcast地址。`total_packets = 可用源hosts数 × 2^32 × 2 × 65536`，是精确整数，不以租约数、规则数或地址段数代替。
+
+**输入**：文件顶层严格为`{"before":[...],"after":[...]}`（API直接接收两个数组；空策略数组合法，表示整域默认拒绝）。沿用8,000,000字节严格JSON读取（重复键、非有限数值拒绝）。每版至多64条规则，数组顺序即业务优先级，绝不按id、前缀长短或action重排；deny与allow都参与第一命中。每项严格为`{id,src,dst,protocol,ports,action}`，所有字段必填且拒绝额外字段：`id`沿用ident校验、各版内互异，两版允许相同id；`src`/`dst`必须是严格IPv4 `/0../32` CIDR字符串，拒绝IPv6、host bits及非字符串，规则前缀允许覆盖池外、允许/0，**不**套用池CIDR的/20下限；`protocol`为`tcp`、`udp`或`any`（`any`同时覆盖tcp与udp，端口区间对两者意义相同）；`ports`必须是恰有两个整数的闭区间`[lo,hi]`且`0<=lo<=hi<=65535`，布尔值不算整数；`action`为`allow`或`deny`。CIDR匹配包含其全部地址，但源分析域始终限于本池可用hosts（规则源范围与池hosts求交，完全在池外的规则保留位置且零覆盖）。
+
+**首命中语义与区域表示**：按数组顺序取全部条件同时成立的第一条规则，无命中默认deny且规则id为null。实现以不相交的**盒子（box）**列表表示区域，盒子为`(src闭区间, dst闭区间, 协议2位掩码, 端口闭区间)`，计数全部是区间宽度的精确整数乘积，绝不逐目标地址、逐端口或逐数据包枚举。三项正确性义务由结构保证：
+
+1. *首命中遮蔽*：逐条规则按输入顺序处理，规则的有效（effective）区域=原始（raw）匹配盒子减去此前所有规则有效区域的并；盒子相减只在操作数边界切割并产出互不相交的分区，更早覆盖的包域被精确扣除，绝不重复计数。无任何规则命中的包落入默认deny区域（整域减去全部有效区域）。
+2. *精确交集*：每版的有效区域加默认区域是一组互斥盒子且恰好覆盖整域一次；两版分区两两求交得到的转移区域同样互斥且恰好覆盖整域一次，因此转移计数之和严格等于`total_packets`，而不是比较两版allow总量。
+3. *最大端点与最小见证*：相减只在边界切割、保留最大端点，每个盒子的下角即该盒内真实存在的包；按`(src数值, dst数值, tcp先于udp, port)`的字典序，盒内最小包就是其下角，取区域内各盒最小者即得该组合的最小witness，不做任何抽样。
+
+**逐规则用量**：`before`/`after`按该版输入规则顺序列出全部规则（零覆盖也保留），最后各附一条默认项；每项严格为`{id,action,raw_packets,effective_packets,shadowed_packets}`。普通项`action`为原规则action，`raw_packets`为域内原始匹配数、`effective_packets`为实际首命中数、`shadowed_packets=raw-effective`；默认项`id=null`、`action=deny`、`raw_packets=total_packets`、`effective_packets`为该版全部未命中包数、`shadowed_packets=total-effective`。单版所有`effective_packets`（含默认项）之和等于`total_packets`。
+
+**转移与放行变化**：`transitions`每项严格为`{before_rule,after_rule,before_action,after_action,packets,witness}`，规则字段为id或默认null，action从对应规则或默认项确定；只输出`packets>0`的组合，每个组合只出现一次，按`before_rule`再`after_rule`排序，各维按Python字符串顺序、null排在全部字符串之后。同action但首命中id改变、乃至id与action完全相同的组合都保留。对`before_rule`或`after_rule`分别做边缘汇总，恰等于对应版的`effective_packets`。由这些组合汇总deny→allow的`newly_allowed`与allow→deny的`newly_denied`。`witness`为`{src,dst,protocol,port}`，src/dst为规范IPv4字符串、protocol只能为tcp或udp、port为整数，必须真实属于该组合并满足题述最小包序。全部数值用整数精确计算与JSON序列化，无浮点近似。
+
+**事务与CLI**：分析在单个只读快照读取cidr/clock，输入不合法、池未初始化、计算或发布失败都不改变业务数据库。CLI在API相同报告上增加`source_sha256`（输入原字节SHA256），以现有原子发布方式保存完整JSON并在stdout输出相同报告，成功退出0；错误退出2且仅向stderr说明原因，不打印成功JSON并保留已有输出。输入、输出、数据库须为不同路径，三者的符号链接均拒绝；缺失数据库失败且不创建空库。

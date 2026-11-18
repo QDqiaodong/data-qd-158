@@ -3,3 +3,4 @@
 - `input.json`：JSON演示入口的地址与操作。
 - `reconcile.json`：一次性对账请求。
 - `flows.json`：离线归属的按地址采样流量，配套192.0.2.0/29上的A续租验收场景（见README）。
+- `acl-diff.json`：离线ACL首命中差异审计的两版有序策略（/32池验收样例，B/D/A规则）。

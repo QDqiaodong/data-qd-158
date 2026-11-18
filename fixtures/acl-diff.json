@@ -1,0 +1,30 @@
+{
+  "before": [
+    {
+      "id": "B",
+      "src": "0.0.0.0/0",
+      "dst": "0.0.0.0/0",
+      "protocol": "tcp",
+      "ports": [80, 81],
+      "action": "allow"
+    }
+  ],
+  "after": [
+    {
+      "id": "D",
+      "src": "0.0.0.0/0",
+      "dst": "0.0.0.0/1",
+      "protocol": "tcp",
+      "ports": [81, 81],
+      "action": "deny"
+    },
+    {
+      "id": "A",
+      "src": "0.0.0.0/0",
+      "dst": "0.0.0.0/0",
+      "protocol": "tcp",
+      "ports": [81, 82],
+      "action": "allow"
+    }
+  ]
+}

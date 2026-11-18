@@ -297,6 +297,38 @@ class Pool:
             connection.rollback();raise
         finally:
             if owned:connection.close()
+    def acl_diff(self,before,after):
+        """Offline ordered ACL first-hit diff in a read-only snapshot.
+
+        Reads ``cidr`` and ``clock`` in one read-only, read-consistent
+        transaction (never advancing the clock, never reaping expiry or
+        writing any table) and resolves both policy versions entirely in
+        memory.  Lease, external-claim and history tables are not consulted,
+        so legacy pools without any of them audit unchanged.
+        """
+        from .acl import build_report
+        if self.path in (':memory:',''):
+            connection,owned=self.db,False
+        else:
+            # A read-only URI open fails on a missing file without creating
+            # an empty database, preserving the no-side-effect guarantee even
+            # when the Pool was constructed before the database existed.
+            if not Path(self.path).is_file():
+                raise ValueError('initialize pool first')
+            uri=Path(self.path).resolve().as_uri()+'?mode=ro'
+            connection,owned=sqlite3.connect(uri,uri=True,timeout=10),True
+        try:
+            connection.execute('BEGIN')
+            try:row=connection.execute('SELECT cidr,clock FROM metadata WHERE id=1').fetchone()
+            except sqlite3.OperationalError:row=None
+            if not row:raise ValueError('initialize pool first')
+            cidr,clock=row
+            report=build_report(cidr,clock,before,after)
+            connection.commit();return report
+        except Exception:
+            connection.rollback();raise
+        finally:
+            if owned:connection.close()
     def _read_connection(self):
         """A second read-only connection so attribution cannot mutate the pool."""
         if self.path in (':memory:',''):

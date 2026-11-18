@@ -85,3 +85,17 @@ flows.json严格为`{"flows":[{"id":"f1","address":"192.0.2.1","start":0,"end":1
 选路先取最长前缀再取最小metric并保留全部并列路由；直连路由贡献接口，网关路由递归解析其`via`，结果是集合方程的最小不动点——纯环为空集，带出口的环传播全部出口，最优via不可达时不得退而使用次优metric。每个情景只撤去`down`接口上的直连路由（via路由永不删除），随后重新做完整选路与递归解析；池外网关的出口变化会传导到池内所有依赖地址。实现用trie做最长前缀匹配、沿获选via惰性构建依赖图（不枚举池外地址或递归路径），再在迭代Kosaraju得到的SCC压缩DAG上按拓扑逆序求接口标签并集，保证循环终止、故障后重新选择且情景间完全隔离。
 
 报告严格含`cidr`、`clock`、`baseline`、`scenarios`：`baseline`是覆盖全部可用hosts的最大连续闭区间（`{start,end,interfaces}`）；每情景只输出集合变化的最大连续区间（`{start,end,before,after}`）及`changed_hosts`、`lost_hosts`、`recovered_hosts`（按区间内地址数累计），空接口集合表示不可达，区间按IPv4数值排序、接口按Python字符串排序。CLI另加`source_sha256`，stdout与输出文件内容相同；出错退出2并保留旧报告，拒绝路径冲突与符号链接，缺失/未初始化的池失败且不创建数据库。分析在单个只读快照读取`cidr`/`clock`，不推进clock、不清理到期数据、不写入任何表，无归属历史的旧池同样可用。详见[数据契约](docs/contract.md)。
+
+## 离线有序ACL首命中差异审计
+
+对两版有序ACL策略（每版至多64条规则）做精确的首命中差异审计，分析域为本池全部可用源hosts × 全部2^32个目标IPv4 × `{tcp,udp}` × 65536个目标端口，全程只读、离线、不接触真实网络：
+
+```sh
+.venv/bin/ipv4-admin --db run/pool.sqlite acl-diff --source acl.json --output acl-report.json
+```
+
+`acl.json`严格为`{"before":[...],"after":[...]}`（API为`Pool.acl_diff(before, after)`，直接接收两个数组；空策略合法）。规则项严格为`{id,src,dst,protocol,ports,action}`：`src`/`dst`是严格IPv4 `/0../32` CIDR（可覆盖池外、可/0，不受池/20下限约束），`protocol`为tcp/udp/any，`ports`为恰含两个整数的闭区间`[lo,hi]`（0..65535，布尔拒绝），`action`为allow/deny；id各版内互异、两版可复用，数组顺序即优先级且永不重排。逐包按数组顺序取第一条全部条件成立的规则，无命中默认deny（id为null），deny与allow都参与第一命中。
+
+实现以不相交的符号盒子（源/目标/协议/端口四元区间）表示包域，盒子相减只在边界切割，计数全部是区间宽度的精确整数乘积，**不枚举任何地址、端口或数据包**：每版逐规则报告`raw_packets`（原始匹配）、`effective_packets`（扣除更早规则覆盖后的实际首命中）与`shadowed_packets`（两者差），默认项报告整域未命中数；两版互斥首命中分区两两求交，给出每个非空`(before_rule,after_rule)`组合的精确`packets`和该组合按`(src数值,dst数值,tcp先于udp,port)`字典序最小的`witness`，组合互斥且恰好覆盖整域一次。据此汇总deny→allow的`newly_allowed`、allow→deny的`newly_denied`（同action改id、乃至完全相同的非空组合都保留），而不是只比较两版allow总量。
+
+报告严格含`cidr`、`clock`、`total_packets`、`newly_allowed`、`newly_denied`、`before`、`after`、`transitions`，全部整数精确计算、无浮点；CLI另加`source_sha256`，stdout与输出文件内容相同并原子发布，出错退出2、只写stderr、保留旧报告，拒绝输入/输出/数据库路径冲突及三者的符号链接，缺失数据库失败且不创建空库。分析只在一个只读一致快照读取cidr/clock，不推进clock、不清理到期事实、不写任何表，无历史表的旧池同样可审计。`fixtures/acl-diff.json`为/32池的B/D/A验收样例；详见[数据契约](docs/contract.md)。
