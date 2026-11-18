@@ -2,6 +2,7 @@
 import ipaddress,sqlite3
 from pathlib import Path
 from .common import ident,number
+from .reconcile import parse_request,plan
 
 def network(cidr):
     if not isinstance(cidr,str):raise ValueError('CIDR required')
@@ -45,5 +46,31 @@ class Pool:
             elif kind=='release':self.db.execute('DELETE FROM leases WHERE client=?',(client,))
             leases=[{'client':c,'address':str(ipaddress.IPv4Address(a)),'expires':e} for c,a,e in self.db.execute('SELECT client,address,expires FROM leases ORDER BY address')]
             self.db.commit();return {'cidr':cidr,'clock':now,'leases':leases}
+        except Exception:
+            self.db.rollback();raise
+    def reconcile(self,now,demands,blocked):
+        """Authoritatively replace the live lease set in one transaction.
+
+        ``demands``/``blocked`` are the raw contract values; validation and
+        the two-level optimisation happen here.  Any error rolls back leases,
+        expiry cleanup and the clock.
+        """
+        now,demands,blocked_ranges=parse_request(now,demands,blocked)
+        try:
+            self.db.execute('BEGIN IMMEDIATE')
+            row=self.db.execute('SELECT cidr,clock FROM metadata WHERE id=1').fetchone()
+            if not row:raise ValueError('initialize pool first')
+            cidr,clock=row
+            if now<clock:raise ValueError('clock cannot move backward')
+            old_active={c:a for c,a,e in self.db.execute('SELECT client,address,expires FROM leases WHERE expires>?',(now,))}
+            net=network(cidr)
+            assigned=plan(net,demands,blocked_ranges,old_active)
+            self.db.execute('DELETE FROM leases')
+            for client,ttl,_ in demands:
+                self.db.execute('INSERT INTO leases VALUES(?,?,?)',(client,assigned[client],now+ttl))
+            self.db.execute('UPDATE metadata SET clock=? WHERE id=1',(now,))
+            leases=[{'client':c,'address':str(ipaddress.IPv4Address(a)),'expires':e} for c,a,e in self.db.execute('SELECT client,address,expires FROM leases ORDER BY address')]
+            moved=sorted(client for client in old_active if client in assigned and assigned[client]!=old_active[client])
+            self.db.commit();return {'cidr':cidr,'clock':now,'leases':leases,'moved_clients':moved}
         except Exception:
             self.db.rollback();raise
