@@ -33,3 +33,23 @@ JSON入口是隔离临时数据库中的可重现操作演示，输入cidr及ope
 每个flow按时间输出不重叠且完整覆盖`[start,end)`的最大连续`segments`，字段为`start/end/status/client/bytes`。`status`为`owned`、`free`、`unknown`或`outside_pool`：池可用hosts内且早于`coverage_start`为`unknown`；覆盖内无持有者为`free`；有持有者为`owned`并填`client`；其他`client`为`null`；非池可用hosts地址全程`outside_pool`（优先于`unknown`，沿用/31与/32的hosts语义）。
 
 先形成最大连续归属段，再按段长度占flow总时长比例分配整数字节：先各取精确有理份额的下整，余字节按小数余数从大到小、同余数按`start`从小到大各加1；全程整数运算，精确守恒。报告`flows`按`id`排序、`segments`按`start`排序、`totals`按`(status, client或空串)`排序并逐组汇总已分摊bytes。API返回`cidr`、`coverage_start`、`clock`、`snapshot_seq`、`flows`及`totals`；CLI另加`source_sha256`（源文件原字节摘要），stdout输出同一完整报告、退出0，并原子发布到`--output`。出错退出2并保留旧报告；拒绝source/output/database路径冲突及符号链接输出。
+
+## 离线DHCP外部占用（import-dhcp）
+
+`Pool.import_dhcp(now, capture_path)` / `ipv4-admin --db DB import-dhcp --now N --source FILE`把PCAP中的有效DHCPACK转成有期限的外部地址占用。仅用Python标准库与SQLite，不访问网络；API读取`capture_path`原字节，CLI只衔接入口。
+
+**容器**：仅经典PCAP v2.4，支持大端（魔数`a1b2c3d4`）与小端（`d4c3b2a1`）的微秒时间格式，linktype必须为Ethernet(1)，不支持pcapng或纳秒魔数（`a1b23c4d`/`4d3cb2a1`）。文件≤8,000,000字节；校验24字节全局头、每个16字节记录头与记录边界，snaplen为1..262144，每帧`0<incl_len=orig_len<=snaplen`，usec为0..999999、秒数为0..now。坏头、截断或不支持的容器使整次失败。时间戳不要求按文件顺序递增；秒数直接作为本池tick单位，微秒仅校验范围，不参与租约TTL。
+
+**帧与IP**：帧至少14字节Ethernet头，仅处理EtherType=0x0800且protocol=17的IPv4帧，其他EtherType/协议忽略；不处理VLAN、IPv6或IP options。受处理帧必须version=4、IHL=5，total_length为20..65535且不超捕获字节，IP头校验和正确，保留flag为0，DF不能与MF或非零offset同现；total_length之外的Ethernet padding忽略。IP分片offset以8字节为单位，载荷必须非空，MF=1时载荷长度须为8的倍数，offset加载荷长度不得超过65515。
+
+**重组**：按`(src,dst,protocol,id)`跨帧重组，支持乱序、交错及字节相同的重复/交叠分片；重叠字节不一致、终片长度矛盾、缺零偏移片、缺MF=0终片或留有空洞均拒绝整个导入，即使此前已拼出完整报文、后续冲突仍使整次失败。约定同一文件的同一四元组仅代表一个IP数据报；终片确定的总载荷长度唯一，任何片的字节都不得超出该长度。每组`observed_at`取所有零偏移片中最早的捕获秒数。全部组都通过后才处理入库；未分片UDP走相同一致性规则。
+
+**UDP/DHCP**：完整UDP载荷至少8字节，UDP length须与重组字节数一致；checksum=0合法，否则用IPv4伪首部（奇数字节补零）验证。只解码67→68端口，其余UDP忽略。DHCP至少240字节且magic cookie为`63825363`；options按pad=0、end=255及长度字节解码，越界或缺end拒绝，end后字节忽略，未知option忽略。option 52（仅可在主options出现一次、值1/2/3）选择file/sname过载区域，所选区域按同一TLV规则解析且其内不得再出现52。option 53须跨所有已选区域恰好出现一次且长度1；非ACK（type≠5）只忽略。ACK须op=2、htype=1、hlen=6，option 51与54各恰一次且长度4；51为网络序1..10^9的TTL，54为非零server IPv4，yiaddr须非零，mac取chaddr前6字节规范为小写冒号。必需option重复、长度错或不合法均使整次失败。yiaddr不属于本池可用hosts的ACK忽略（沿用/20../30及/31、/32的hosts语义）。
+
+**事实与到期**：一条事实以五元组`(server,mac,address,observed_at,ttl)`标识，`expires=observed_at+ttl`（最早零偏移捕获秒数加option 51秒数，不能取导入now加TTL）。仅保留`expires>当前操作now`的事实，到期恰等于now即失效；相同五元组重复导入不累加也不延长，旧捕获到期后重导不得复活；不同server或mac对同地址的独立宣告分别保留，互不覆盖。不得从当前本地leases或既有归属历史伪造外部事实。
+
+**事务**：导入在一次`BEGIN IMMEDIATE`中按原clock拒绝时间倒退，清理到期本地租约与外部事实、写入本次仍有效事实、推进clock，并在已启用历史时于同一事务追加一条原post-state历史事件；任何解析、校验或写入失败都不改变租约、外部事实、clock及历史序号。旧库仅在第一次`import-dhcp`显式建立新表，旧命令不因缺表失效；只有确认外部表不存在时才视为空集合，损坏或其他SQL错误不得吞掉。导入不会替旧库偷偷启用历史；`attribute_flows`保持只读，不清理或写入外部事实，也不把第三方宣告当作本地持有者。
+
+**与本地租约的关系**：有效外部占用不驱逐现存本地租约，但在`conflicts`报告同地址活跃client与全部活跃外部事实；冲突不构成导入失败，也不把本地client与mac自动视作同一主体。`acquire`的活跃client原地址若被有效外部占用，续租必须失败、不得偷换地址；新client取符合排除条件的最小空闲地址。`reconcile`仍以原权威demands与原两级全局目标求解，只在实际候选（同事务内）排除`expires>now`的外部地址，不可行时连过期清理整体回滚，`moved_clients`原定义不变。排除发生在各自原写事务内，不能只在CLI预查或把外部事实临时拼成一次blocked输入。`release/list`仍按原规则成功并随事务清理外部到期事实；无外部占用时旧分配目标、返回结构、历史归属与JSON演示结果保持兼容。
+
+**返回**：API与CLI成功返回同一JSON：`cidr`、`clock`、`leases`（原结构、按地址排序）、`claims`、`conflicts`、`source_sha256`（捕获文件原字节SHA256，事实身份不依赖路径或摘要）。`claims`列出提交后全部活跃外部事实，每项为`server`、`mac`、`address`、`observed_at`、`ttl`、`expires`，按`(address数值,server数值,mac,observed_at,ttl)`排序。`conflicts`每项为`address`、`client`、`claims`，按address数值排序，内层`claims`沿用同一排序；无冲突为空数组。拒绝source/database同路径及符号链接source或database。成功stdout输出JSON并退出0；错误退出2、stderr说明原因且不输出成功JSON。

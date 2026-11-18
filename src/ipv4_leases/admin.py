@@ -16,6 +16,7 @@ def main():
         if kind!='list':q.add_argument('--client',required=True)
         if kind=='acquire':q.add_argument('--ttl',type=int,required=True)
     rec=sub.add_parser('reconcile');rec.add_argument('--source',type=Path,required=True)
+    imp=sub.add_parser('import-dhcp');imp.add_argument('--now',type=int,required=True);imp.add_argument('--source',type=Path,required=True)
     sub.add_parser('history-enable')
     att=sub.add_parser('attribute');att.add_argument('--source',type=Path,required=True);att.add_argument('--output',type=Path,required=True)
     args=p.parse_args();pool=None
@@ -29,9 +30,14 @@ def main():
             else:
                 _conflict([args.source,args.output,args.db])
                 request,digest=read(args.source);require(request,'flows')
+        elif args.op=='import-dhcp':
+            if args.source.is_symlink():raise ValueError('symlink capture source rejected')
+            _conflict([args.source,args.db])
+            if not args.source.is_file():raise ValueError('capture source missing')
         pool=Pool(args.db)
         if args.op=='init':out=pool.initialize(args.cidr)
         elif args.op=='reconcile':out=pool.reconcile(request['now'],request['demands'],request['blocked'])
+        elif args.op=='import-dhcp':out=pool.import_dhcp(args.now,args.source)
         elif args.op=='history-enable':out=pool.enable_history()
         elif args.op=='attribute':
             out=pool.attribute_flows(request['flows']);out['source_sha256']=digest;save(args.output,out)

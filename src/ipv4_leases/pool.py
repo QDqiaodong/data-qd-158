@@ -1,14 +1,21 @@
 """Exclusive live IPv4 leases, with explicit monotonic logical clock."""
-import ipaddress,sqlite3
+import hashlib,ipaddress,sqlite3
 from pathlib import Path
 from .common import ident,number
 from .reconcile import parse_request,plan
+from .dhcp import MAX_CAPTURE_BYTES,parse_capture
 
 HISTORY_TABLES=(
     'CREATE TABLE IF NOT EXISTS history_meta (id INTEGER PRIMARY KEY CHECK(id=1), coverage_start INTEGER NOT NULL)',
     'CREATE TABLE IF NOT EXISTS history_events (seq INTEGER PRIMARY KEY, now INTEGER NOT NULL)',
     'CREATE TABLE IF NOT EXISTS history_changes (seq INTEGER NOT NULL, address INTEGER NOT NULL, client TEXT, expires INTEGER, PRIMARY KEY(seq,address))',
     'CREATE INDEX IF NOT EXISTS history_changes_address ON history_changes(address,seq)',
+)
+EXTERNAL_TABLE=(
+    'CREATE TABLE IF NOT EXISTS external_dhcp_claims ('
+    'server INTEGER NOT NULL, mac TEXT NOT NULL, address INTEGER NOT NULL, '
+    'observed_at INTEGER NOT NULL, ttl INTEGER NOT NULL, expires INTEGER NOT NULL, '
+    'PRIMARY KEY(server,mac,address,observed_at,ttl))'
 )
 
 def network(cidr):
@@ -79,6 +86,30 @@ class Pool:
             return {'cidr':cidr,'coverage_start':coverage,'clock':clock,'snapshot_seq':0}
         except Exception:
             self.db.rollback();raise
+    def _external_table_exists(self):
+        # Only a genuinely absent table is treated as the empty legacy set;
+        # every other SQL error must propagate instead of being swallowed.
+        return self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='external_dhcp_claims'"
+        ).fetchone() is not None
+    def _active_external(self,now):
+        """Active external facts (``expires > now``) as canonical claim rows.
+
+        Each row is ``(address,server,mac,observed_at,ttl,expires)`` ordered
+        exactly like the public claims output.
+        """
+        if not self._external_table_exists():return []
+        rows=list(self.db.execute(
+            'SELECT address,server,mac,observed_at,ttl,expires FROM external_dhcp_claims WHERE expires>?',(now,)))
+        rows.sort(key=lambda row:(row[0],row[1],row[2],row[3],row[4]))
+        return rows
+    def _claim_dicts(self,rows):
+        claims=[]
+        for address,server,mac,observed_at,ttl,expires in rows:
+            claims.append({'server':str(ipaddress.IPv4Address(server)),'mac':mac,
+                           'address':str(ipaddress.IPv4Address(address)),
+                           'observed_at':observed_at,'ttl':ttl,'expires':expires})
+        return claims
     def _leases_by_address(self):
         return {a:(c,e) for c,a,e in self.db.execute('SELECT client,address,expires FROM leases')}
     def _append_history(self,now,before):
@@ -105,10 +136,16 @@ class Pool:
             history=self._coverage() is not None
             before=self._leases_by_address() if history else None
             self.db.execute('DELETE FROM leases WHERE expires<=?',(now,))
+            if self._external_table_exists():
+                self.db.execute('DELETE FROM external_dhcp_claims WHERE expires<=?',(now,))
+            external={row[0] for row in self._active_external(now)}
             self.db.execute('UPDATE metadata SET clock=? WHERE id=1',(now,))
             if kind=='acquire':
                 old=self.db.execute('SELECT address FROM leases WHERE client=?',(client,)).fetchone()
-                used={r[0] for r in self.db.execute('SELECT address FROM leases')}
+                if old and old[0] in external:
+                    raise ValueError('client renewal blocked by active external DHCP claim on address %s'
+                                     % ipaddress.IPv4Address(old[0]))
+                used={r[0] for r in self.db.execute('SELECT address FROM leases')}|external
                 address=old[0] if old else next((int(a) for a in network(cidr).hosts() if int(a) not in used),None)
                 if address is None:raise ValueError('pool exhausted')
                 self.db.execute('INSERT INTO leases VALUES(?,?,?) ON CONFLICT(client) DO UPDATE SET expires=excluded.expires',(client,address,now+ttl))
@@ -135,6 +172,13 @@ class Pool:
             history=self._coverage() is not None
             before=self._leases_by_address() if history else None
             old_active={c:a for c,a,e in self.db.execute('SELECT client,address,expires FROM leases WHERE expires>?',(now,))}
+            self.db.execute('DELETE FROM leases WHERE expires<=?',(now,))
+            if self._external_table_exists():
+                self.db.execute('DELETE FROM external_dhcp_claims WHERE expires<=?',(now,))
+            # External exclusions are enforced inside this transaction rather
+            # than pre-checked by the CLI: merge each active claim as a /32.
+            blocked_ranges=list(blocked_ranges)
+            blocked_ranges.extend((row[0],row[0]) for row in self._active_external(now))
             net=network(cidr)
             assigned=plan(net,demands,blocked_ranges,old_active)
             self.db.execute('DELETE FROM leases')
@@ -145,6 +189,64 @@ class Pool:
             leases=[{'client':c,'address':str(ipaddress.IPv4Address(a)),'expires':e} for c,a,e in self.db.execute('SELECT client,address,expires FROM leases ORDER BY address')]
             moved=sorted(client for client in old_active if client in assigned and assigned[client]!=old_active[client])
             self.db.commit();return {'cidr':cidr,'clock':now,'leases':leases,'moved_clients':moved}
+        except Exception:
+            self.db.rollback();raise
+    def import_dhcp(self,now,capture_path):
+        """Import bounded external DHCPACK occupancy from an offline capture.
+
+        The capture is parsed and validated in full before the database is
+        touched.  Inside one ``BEGIN IMMEDIATE`` transaction the clock is
+        checked for backward motion, expired local leases and external facts
+        are reaped, the still-valid facts from this capture are merged (the
+        five-tuple identity makes re-imports idempotent and never extends an
+        existing expiry) and the clock advances to ``now`` with one history
+        event when history is enabled.  Any failure rolls back everything,
+        including a legacy pool's first-time table creation.
+        """
+        now=number(now,0,10**12)
+        source=Path(capture_path)
+        with source.open('rb') as stream:raw=stream.read(MAX_CAPTURE_BYTES+1)
+        if len(raw)>MAX_CAPTURE_BYTES:raise ValueError('capture exceeds 8 MB')
+        digest=hashlib.sha256(raw).hexdigest()
+        # Pure parsing: no schema is migrated by a bad capture.
+        facts=parse_capture(raw,now)
+        try:
+            self.db.execute('BEGIN IMMEDIATE')
+            row=self.db.execute('SELECT cidr,clock FROM metadata WHERE id=1').fetchone()
+            if not row:raise ValueError('initialize pool first')
+            cidr,clock=row
+            if now<clock:raise ValueError('clock cannot move backward')
+            history=self._coverage() is not None
+            before=self._leases_by_address() if history else None
+            net=network(cidr)
+            usable={int(host) for host in net.hosts()}
+            self.db.execute(EXTERNAL_TABLE)
+            self.db.execute('DELETE FROM leases WHERE expires<=?',(now,))
+            self.db.execute('DELETE FROM external_dhcp_claims WHERE expires<=?',(now,))
+            for fact in facts:
+                if fact['address'] not in usable:continue  # ACKs outside the pool are simply ignored
+                if fact['expires']<=now:continue  # expired before/at this operation
+                self.db.execute(
+                    'INSERT OR IGNORE INTO external_dhcp_claims VALUES(?,?,?,?,?,?)',
+                    (fact['server'],fact['mac'],fact['address'],
+                     fact['observed_at'],fact['ttl'],fact['expires']))
+            self.db.execute('UPDATE metadata SET clock=? WHERE id=1',(now,))
+            if history:self._append_history(now,before)
+            active_rows=self._active_external(now)
+            claims=self._claim_dicts(active_rows)
+            by_address={}
+            for claim in active_rows:by_address.setdefault(claim[0],[]).append(claim)
+            conflicts=[]
+            for client,address,expires in self.db.execute('SELECT client,address,expires FROM leases ORDER BY address'):
+                if address in by_address:
+                    conflicts.append({'address':str(ipaddress.IPv4Address(address)),'client':client,
+                                      'claims':self._claim_dicts(by_address[address])})
+            conflicts.sort(key=lambda item:int(ipaddress.IPv4Address(item['address'])))
+            leases=[{'client':c,'address':str(ipaddress.IPv4Address(a)),'expires':e}
+                    for c,a,e in self.db.execute('SELECT client,address,expires FROM leases ORDER BY address')]
+            self.db.commit()
+            return {'cidr':cidr,'clock':now,'leases':leases,'claims':claims,
+                    'conflicts':conflicts,'source_sha256':digest}
         except Exception:
             self.db.rollback();raise
     def attribute_flows(self,flows):
