@@ -19,17 +19,24 @@ def main():
     imp=sub.add_parser('import-dhcp');imp.add_argument('--now',type=int,required=True);imp.add_argument('--source',type=Path,required=True)
     sub.add_parser('history-enable')
     att=sub.add_parser('attribute');att.add_argument('--source',type=Path,required=True);att.add_argument('--output',type=Path,required=True)
+    rim=sub.add_parser('route-impact');rim.add_argument('--source',type=Path,required=True);rim.add_argument('--output',type=Path,required=True)
     args=p.parse_args();pool=None
     try:
         if args.db.is_symlink():raise ValueError('symlink database rejected')
         if args.op!='init' and not args.db.is_file():raise ValueError('database missing; initialize first')
         request=None
-        if args.op in ('reconcile','attribute'):
+        if args.op in ('reconcile','attribute','route-impact'):
             if args.op=='reconcile':
                 request,_=read(args.source);require(request,'now demands blocked')
-            else:
+            elif args.op=='attribute':
                 _conflict([args.source,args.output,args.db])
                 request,digest=read(args.source);require(request,'flows')
+            else:
+                if args.source.is_symlink():raise ValueError('symlink route source rejected')
+                if args.output.is_symlink():raise ValueError('symlink output rejected')
+                _conflict([args.source,args.output,args.db])
+                if not args.source.is_file():raise ValueError('route source missing')
+                request,digest=read(args.source);require(request,'routes scenarios')
         elif args.op=='import-dhcp':
             if args.source.is_symlink():raise ValueError('symlink capture source rejected')
             _conflict([args.source,args.db])
@@ -41,6 +48,8 @@ def main():
         elif args.op=='history-enable':out=pool.enable_history()
         elif args.op=='attribute':
             out=pool.attribute_flows(request['flows']);out['source_sha256']=digest;save(args.output,out)
+        elif args.op=='route-impact':
+            out=pool.route_impact(request['routes'],request['scenarios']);out['source_sha256']=digest;save(args.output,out)
         else:out=pool.operate(args.op,args.now,getattr(args,'client',None),getattr(args,'ttl',None))
         print(json.dumps(out,sort_keys=True));return 0
     except (OSError,ValueError,TypeError,KeyError,OverflowError,RecursionError,sqlite3.Error) as e:print(str(e),file=sys.stderr);return 2

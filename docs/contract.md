@@ -53,3 +53,17 @@ JSON入口是隔离临时数据库中的可重现操作演示，输入cidr及ope
 **与本地租约的关系**：有效外部占用不驱逐现存本地租约，但在`conflicts`报告同地址活跃client与全部活跃外部事实；冲突不构成导入失败，也不把本地client与mac自动视作同一主体。`acquire`的活跃client原地址若被有效外部占用，续租必须失败、不得偷换地址；新client取符合排除条件的最小空闲地址。`reconcile`仍以原权威demands与原两级全局目标求解，只在实际候选（同事务内）排除`expires>now`的外部地址，不可行时连过期清理整体回滚，`moved_clients`原定义不变。排除发生在各自原写事务内，不能只在CLI预查或把外部事实临时拼成一次blocked输入。`release/list`仍按原规则成功并随事务清理外部到期事实；无外部占用时旧分配目标、返回结构、历史归属与JSON演示结果保持兼容。
 
 **返回**：API与CLI成功返回同一JSON：`cidr`、`clock`、`leases`（原结构、按地址排序）、`claims`、`conflicts`、`source_sha256`（捕获文件原字节SHA256，事实身份不依赖路径或摘要）。`claims`列出提交后全部活跃外部事实，每项为`server`、`mac`、`address`、`observed_at`、`ttl`、`expires`，按`(address数值,server数值,mac,observed_at,ttl)`排序。`conflicts`每项为`address`、`client`、`claims`，按address数值排序，内层`claims`沿用同一排序；无冲突为空数组。拒绝source/database同路径及符号链接source或database。成功stdout输出JSON并退出0；错误退出2、stderr说明原因且不输出成功JSON。
+
+## 离线路由故障影响分析（route-impact）
+
+`Pool.route_impact(routes, scenarios)` / `ipv4-admin --db DB route-impact --source FILE --output FILE`在单个SQLite只读一致快照中读取`cidr`与`clock`，完全离线计算各接口故障情景下本池可用hosts的有效转发出口区间；不连接真实网络，不推进clock、不清理到期租约或外部事实、不写入任何表，也不要求归属历史存在（无历史表的旧池同样可分析）。沿用/31、/32的hosts语义，只分析池的可用hosts。
+
+**输入**：文件顶层严格为`{"routes":[...],"scenarios":[...]}`（API直接接收两个数组），沿用8,000,000字节上限、严格JSON（重复键、非有限数值、未知字段一律拒绝）。`routes`至多2048项，每项严格为`{id,prefix,metric,via,interface}`：`id`为标识且在routes内互异；`prefix`为严格IPv4 `/0../32` CIDR（拒绝IPv6、host bits，**不**套用池的/20下限，可覆盖全空间或完全在池外）；`metric`为`0..10^9`整数（布尔拒绝）；`via`与`interface`恰有一个非null——`via`为严格IPv4文本地址，`interface`为非空标识。同一prefix与metric可有多个不同id的等价路由。`scenarios`至多32项，每项严格为`{id,down}`，`id`在scenarios内互异（与route id不跨类检查），`down`为互异标识列表、至多2048项且每个接口都必须出现在原路由的`interface`中。空routes、空scenarios、空down均合法。
+
+**选路与递归语义**：对任意IPv4地址，先在包含它的前缀中取最长前缀，再在该前缀内取最小`metric`，保留全部并列路由；无匹配即不可达（空集）。直连路由贡献其`interface`；网关路由贡献对其`via`地址按同一规则继续解析得到的接口集合。整体结果是该集合方程组的**最小不动点**：纯循环为空集；循环连通可达出口时必须传播全部出口，不得遇环否定整个分支，也不得把DFS中途得到的暂时空集缓存为最终结果。网关可在池外，仍须用完整路由事实求解。等价路由只贡献接口集合的并，不按路径或id计权重。最优路由集合不可达时结果即空集——最优metric的via陷入纯环时，不得改用仍存在的次优metric直连路由；这是“先按存在的事实选路、再求递归接口集合”的语义，不能预先删除所有不可达via。
+
+**故障情景**：每个情景独立从原路由集合开始，只撤去`interface`属于`down`的直连路由；不直接删除via路由，也不因其不可达而尝试次优metric。撤去更具体的直连路由后，较短前缀或较大metric的候选必须重新参与最长前缀/metric选择。情景间不得泄漏状态：实现为每个情景从过滤后的事实副本构建全新选路结构与图，循环分量按当次事实重新求解，过期出口不会残留。影响核算比较基准与情景的**最终接口集合**（而非被删路由的prefix或首跳），池外网关的出口变化会传导到池内所有依赖地址，即使这些地址的获选路由id完全未变。
+
+**算法与终止**：选路用按前缀组织的二进制trie做最长前缀匹配，每个前缀节点预算该前缀的最小metric路由集。依赖图从池hosts出发、沿获选via惰性扩展（不枚举池外IPv4空间、不枚举递归路径），节点规模受路由数界定。接口标签在图的强连通分量（SCC）压缩DAG上求解：迭代式Kosaraju（无递归深度问题，支持1500层网关链）按拓扑逆序把每个SCC自身直连接口与所有可达后继SCC的标签取并，恰为最小不动点——纯环SCC无自身标签即空集，带出口的环继承全部可达出口。
+
+**输出**：API报告严格包含`cidr`、`clock`、`baseline`、`scenarios`。`baseline`覆盖全部可用hosts的最大连续闭区间，每项为`{start,end,interfaces}`；情景`changes`只列接口集合发生变化的最大连续闭区间，每项为`{start,end,before,after}`，区间按IPv4数值排序、不因路由id或前缀边界人为拆分等价区间，接口集合按Python字符串顺序排序，空数组表示不可达。每情景给出`changed_hosts`（集合改变）、`lost_hosts`（原非空后为空）、`recovered_hosts`（原为空后非空），均按区间内地址数累计而非路由或区间条数；`scenarios`按id排序。CLI在同一报告上增加`source_sha256`，原子保存完整JSON并在stdout打印相同内容，成功退出0。出错退出2并只向stderr说明原因，保留已有报告且不输出成功JSON；拒绝输入/输出/数据库指向同一路径，拒绝三者的符号链接；缺失或未初始化的池失败且不创建数据库。由于故障只撤路由、不增路由，基准为空的地址在任何情景下都不会变为非空，`recovered_hosts`在该语义下恒为0但计数分支仍按通用集合变化实现。

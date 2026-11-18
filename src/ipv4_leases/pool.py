@@ -274,6 +274,29 @@ class Pool:
             connection.rollback();raise
         finally:
             if owned:connection.close()
+    def route_impact(self,routes,scenarios):
+        """Offline interface-fault impact analysis in a read-only snapshot.
+
+        Reads ``cidr`` and ``clock`` in one read-only, read-consistent
+        transaction (never advancing the clock, never reaping expiry or
+        writing any table) and resolves the routing facts entirely in
+        memory.  Lease or history tables are not consulted, so legacy pools
+        without attribution history work unchanged.
+        """
+        from .routing import build_report
+        connection,owned=self._read_connection()
+        try:
+            connection.execute('BEGIN')
+            try:row=connection.execute('SELECT cidr,clock FROM metadata WHERE id=1').fetchone()
+            except sqlite3.OperationalError:row=None
+            if not row:raise ValueError('initialize pool first')
+            cidr,clock=row
+            report=build_report(cidr,clock,routes,scenarios)
+            connection.commit();return report
+        except Exception:
+            connection.rollback();raise
+        finally:
+            if owned:connection.close()
     def _read_connection(self):
         """A second read-only connection so attribution cannot mutate the pool."""
         if self.path in (':memory:',''):

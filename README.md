@@ -71,3 +71,17 @@ flows.json严格为`{"flows":[{"id":"f1","address":"192.0.2.1","start":0,"end":1
 整个导入在一次`BEGIN IMMEDIATE`内拒绝时钟倒退、清理到期本地租约与外部事实、写入本次仍有效事实、推进clock，并在已启用历史时追加一条post-state历史事件；任何解析、校验或写入错误都整体回滚（租约、外部事实、clock、历史序号均不变）。外部占用不驱逐现存本地租约，但在`conflicts`中报告同地址的活跃client与全部外部事实，也不把本地client与mac自动视作同一主体。`acquire`活跃client续租撞上外部占用直接失败（不偷偷换址），新client取满足排除条件的最小空闲地址；`reconcile`仍以原权威demands与原两级全局目标求解，仅在实际候选中（同事务内把每个外部地址作为/32并入blocked）排除外部占用，不可行时连过期清理一起回滚，`moved_clients`定义不变。`release/list`沿用原规则并随事务清理到期外部事实；无外部占用时旧分配目标、返回结构、历史归属与JSON演示结果保持兼容。
 
 成功stdout输出JSON并退出0，字段为`cidr`、`clock`、`leases`（原结构、按地址排序）、`claims`、`conflicts`、`source_sha256`（捕获文件原字节SHA256，事实身份不依赖文件路径或摘要）。`claims`列出提交后全部活跃外部事实，每项含`server`、`mac`、`address`、`observed_at`、`ttl`、`expires`，按`(address数值,server数值,mac,observed_at,ttl)`排序；`conflicts`每项为`address`、`client`、`claims`，按address数值排序，内层`claims`沿用同一排序，无冲突为空数组。出错退出2、只写stderr、不输出成功JSON；拒绝source/database同路径及符号链接source或database。
+
+## 离线路由故障影响分析
+
+给定一组静态路由事实和接口故障情景，离线计算本池每个可用host在故障前后的有效转发出口（接口集合），全程不接触真实网络、只读数据库：
+
+```sh
+.venv/bin/ipv4-admin --db run/pool.sqlite route-impact --source routes.json --output impact.json
+```
+
+`routes.json`严格为`{"routes":[...],"scenarios":[...]}`（≤8MB；API为`Pool.route_impact(routes, scenarios)`，直接接收两个数组）。路由项严格为`{id,prefix,metric,via,interface}`，至多2048条：`prefix`是严格IPv4 `/0../32` CIDR（不受池/20下限约束，可在池外），`metric`为`0..10^9`整数，`via`与`interface`恰有一个非null；同prefix同metric的不同id路由为等价路径。情景项严格为`{id,down}`（至多32个），`down`为互异接口标识且都须出现在原路由的`interface`中（至多2048项）。重复id/down项、未知字段、重复JSON键、布尔metric、IPv6、host bits、via/interface同空或同非空均拒绝。
+
+选路先取最长前缀再取最小metric并保留全部并列路由；直连路由贡献接口，网关路由递归解析其`via`，结果是集合方程的最小不动点——纯环为空集，带出口的环传播全部出口，最优via不可达时不得退而使用次优metric。每个情景只撤去`down`接口上的直连路由（via路由永不删除），随后重新做完整选路与递归解析；池外网关的出口变化会传导到池内所有依赖地址。实现用trie做最长前缀匹配、沿获选via惰性构建依赖图（不枚举池外地址或递归路径），再在迭代Kosaraju得到的SCC压缩DAG上按拓扑逆序求接口标签并集，保证循环终止、故障后重新选择且情景间完全隔离。
+
+报告严格含`cidr`、`clock`、`baseline`、`scenarios`：`baseline`是覆盖全部可用hosts的最大连续闭区间（`{start,end,interfaces}`）；每情景只输出集合变化的最大连续区间（`{start,end,before,after}`）及`changed_hosts`、`lost_hosts`、`recovered_hosts`（按区间内地址数累计），空接口集合表示不可达，区间按IPv4数值排序、接口按Python字符串排序。CLI另加`source_sha256`，stdout与输出文件内容相同；出错退出2并保留旧报告，拒绝路径冲突与符号链接，缺失/未初始化的池失败且不创建数据库。分析在单个只读快照读取`cidr`/`clock`，不推进clock、不清理到期数据、不写入任何表，无归属历史的旧池同样可用。详见[数据契约](docs/contract.md)。
