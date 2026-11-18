@@ -33,5 +33,23 @@ cli.py 衔接数据链路。fixtures 为明确自制样例，代码与样例采�
 本地地址管理员维护一个SQLite数据库对应一个严格CIDR IPv4 /20../32地址池。/20../30排除network/broadcast；/31两地址可用、/32单地址可用，采用Python ipaddress hosts语义。最多4094普通主机。不会配置网卡、发送DHCP或与真实网络交互。
 独立持久入口：.venv/bin/ipv4-admin --db run/pool.sqlite init --cidr 192.0.2.0/30（先mkdir -p run）；随后acquire --now 0 --client A --ttl 10、list --now 10、release --now 10 --client A。数据库父目录须存在。init同CIDR幂等，异CIDR拒绝。
 now为0..10^12逻辑整数tick，每次操作不得倒退；ttl=1..10^9，expires<=now先回收。acquire同活跃client续租原地址、expires重置为now+ttl；新client取最小空闲地址，release无记录正常。BEGIN IMMEDIATE、client主键及address唯一约束，耗尽/时钟错误整事务回滚，连过期清理和clock都不提交。list也会提交过期清理与clock。
-JSON入口是隔离临时数据库中的可重现操作演示，输入cidr及operations，输出每次事务后的状态；实际跨命令持久化用ipv4-admin。样例A=.1到10、B=.2到20，10时C复用.1到15，20时空池。只保留当前租约，无审计历史/请求回执/高可用/恶意文件并发替换沙箱；本地可信单数据库，SQLite协调连接并发。
+JSON入口是隔离临时数据库中的可重现操作演示，输入cidr及operations，输出每次事务后的状态；实际跨命令持久化用ipv4-admin。样例A=.1到10、B=.2到20，10时C复用.1到15，20时空池。只保留当前租约及按需启用的归属历史（见下节），无请求回执/高可用/恶意文件并发替换沙箱；本地可信单数据库，SQLite协调连接并发。
 一次性期望集合对账：.venv/bin/ipv4-admin --db run/pool.sqlite reconcile --source request.json，其中request.json严格为{"now":整数,"demands":[{"client":标识,"ttl":整数,"allowed":[CIDR,...]},...],"blocked":[CIDR,...]}。demands是事务后全部活跃client的权威集合，最多128个互异client，每项allowed为1..32个/0../32严格IPv4 CIDR，blocked至多128个。先在全部完整可行分配中最小化迁移client数，再在client字符串序下取地址向量字典序最小；结果与demands/CIDR排列无关，不枚举完整分配。成功输出含cidr、clock、按地址排序的leases及按client排序的moved_clients，退出0；非法或不可行退出2、不输出成功JSON、数据库保持不变。详见[数据契约](docs/contract.md)。
+
+## 离线流量归属
+
+启用历史（新池`init`时自动从clock=0开始；旧库须显式启用，只从启用时刻起记录，不倒推）：
+
+```sh
+.venv/bin/ipv4-admin --db run/pool.sqlite history-enable
+```
+
+成功返回cidr、coverage_start、clock、snapshot_seq。之后每次成功的acquire/release/list/reconcile在同一事务内追加一条连续seq历史；失败操作不留痕。启用不推进clock、不改租约；重复启用幂等。
+
+按地址采样流量并归属到历史持有者：
+
+```sh
+.venv/bin/ipv4-admin --db run/pool.sqlite attribute --source flows.json --output report.json
+```
+
+flows.json严格为`{"flows":[{"id":"f1","address":"192.0.2.1","start":0,"end":12,"bytes":7},...]}`（≤10000条，8MB）。输出把每个flow切成覆盖`[start,end)`的最大连续段（owned/free/unknown/outside_pool），并按段时长比例用最大余数法精确分配整数字节。CLI在报告中附加`source_sha256`，stdout输出同一报告并原子写`--output`；出错退出2且保留旧报告。`Pool.attribute_flows(flows)`返回同一报告（无`source_sha256`），只读事务、不改clock/租约/历史。
