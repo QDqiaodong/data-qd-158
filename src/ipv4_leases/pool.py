@@ -4,6 +4,7 @@ from pathlib import Path
 from .common import ident,number
 from .reconcile import parse_request,plan
 from .dhcp import MAX_CAPTURE_BYTES,parse_capture
+from .dns import DnsError,compile_mirror,validate_config
 
 HISTORY_TABLES=(
     'CREATE TABLE IF NOT EXISTS history_meta (id INTEGER PRIMARY KEY CHECK(id=1), coverage_start INTEGER NOT NULL)',
@@ -16,6 +17,15 @@ EXTERNAL_TABLE=(
     'server INTEGER NOT NULL, mac TEXT NOT NULL, address INTEGER NOT NULL, '
     'observed_at INTEGER NOT NULL, ttl INTEGER NOT NULL, expires INTEGER NOT NULL, '
     'PRIMARY KEY(server,mac,address,observed_at,ttl))'
+)
+# The persistent offline DNS mirror is configuration only: the structured
+# records stay derived (never materialised), so a replaced or lease-driven
+# change can never leave stale rows behind.  Only configure_dns creates these
+# tables; every other entry point treats their absence as "DNS not enabled".
+DNS_TABLES=(
+    'CREATE TABLE IF NOT EXISTS dns_meta (id INTEGER PRIMARY KEY CHECK(id=1), zone TEXT NOT NULL)',
+    'CREATE TABLE IF NOT EXISTS dns_bindings (client TEXT PRIMARY KEY, name TEXT NOT NULL, reverse INTEGER NOT NULL CHECK(reverse IN (0,1)))',
+    'CREATE TABLE IF NOT EXISTS dns_aliases (owner TEXT PRIMARY KEY, target TEXT NOT NULL)',
 )
 
 def network(cidr):
@@ -112,6 +122,38 @@ class Pool:
         return claims
     def _leases_by_address(self):
         return {a:(c,e) for c,a,e in self.db.execute('SELECT client,address,expires FROM leases')}
+    def _dns_enabled(self):
+        """True only when a real DNS configuration row exists.
+
+        A genuinely missing configuration table means DNS is not enabled and
+        must not be silently created.  A damaged table or any other SQL error
+        propagates instead of being swallowed as "not enabled".
+        """
+        row=self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='dns_meta'").fetchone()
+        if row is None:return False
+        return self.db.execute('SELECT 1 FROM dns_meta WHERE id=1').fetchone() is not None
+    def _load_dns(self):
+        """Read the effective configuration inside an open transaction."""
+        zone=self.db.execute('SELECT zone FROM dns_meta WHERE id=1').fetchone()[0]
+        bindings=[(client,name,bool(reverse))
+                  for client,name,reverse in self.db.execute('SELECT client,name,reverse FROM dns_bindings ORDER BY rowid')]
+        aliases=list(self.db.execute('SELECT owner,target FROM dns_aliases ORDER BY rowid'))
+        return zone,bindings,aliases
+    def _active_for_dns(self,now):
+        """Final active leases as ``{client: (address, expires)}``."""
+        return {client:(address,expires)
+                for client,address,expires in self.db.execute(
+                    'SELECT client,address,expires FROM leases WHERE expires>? ORDER BY client',(now,))}
+    def _dns_guard(self,now):
+        """Compile the mirror for the final lease state or raise and roll back.
+
+        Uses exactly the same compiler and integrity semantics as
+        :meth:`dns_snapshot`, so every write entry point that succeeds has
+        already proven its committed mirror valid.
+        """
+        if not self._dns_enabled():return None
+        zone,bindings,aliases=self._load_dns()
+        return compile_mirror(zone,bindings,aliases,self._active_for_dns(now),now)
     def _append_history(self,now,before):
         row=self.db.execute('SELECT MAX(seq) FROM history_events').fetchone()
         seq=(row[0] or 0)+1
@@ -150,6 +192,7 @@ class Pool:
                 if address is None:raise ValueError('pool exhausted')
                 self.db.execute('INSERT INTO leases VALUES(?,?,?) ON CONFLICT(client) DO UPDATE SET expires=excluded.expires',(client,address,now+ttl))
             elif kind=='release':self.db.execute('DELETE FROM leases WHERE client=?',(client,))
+            self._dns_guard(now)
             if history:self._append_history(now,before)
             leases=[{'client':c,'address':str(ipaddress.IPv4Address(a)),'expires':e} for c,a,e in self.db.execute('SELECT client,address,expires FROM leases ORDER BY address')]
             self.db.commit();return {'cidr':cidr,'clock':now,'leases':leases}
@@ -185,6 +228,7 @@ class Pool:
             for client,ttl,_ in demands:
                 self.db.execute('INSERT INTO leases VALUES(?,?,?)',(client,assigned[client],now+ttl))
             self.db.execute('UPDATE metadata SET clock=? WHERE id=1',(now,))
+            self._dns_guard(now)
             if history:self._append_history(now,before)
             leases=[{'client':c,'address':str(ipaddress.IPv4Address(a)),'expires':e} for c,a,e in self.db.execute('SELECT client,address,expires FROM leases ORDER BY address')]
             moved=sorted(client for client in old_active if client in assigned and assigned[client]!=old_active[client])
@@ -231,6 +275,7 @@ class Pool:
                     (fact['server'],fact['mac'],fact['address'],
                      fact['observed_at'],fact['ttl'],fact['expires']))
             self.db.execute('UPDATE metadata SET clock=? WHERE id=1',(now,))
+            self._dns_guard(now)
             if history:self._append_history(now,before)
             active_rows=self._active_external(now)
             claims=self._claim_dicts(active_rows)
@@ -249,6 +294,83 @@ class Pool:
                     'conflicts':conflicts,'source_sha256':digest}
         except Exception:
             self.db.rollback();raise
+    def configure_dns(self,now,zone,bindings,aliases):
+        """Authoritatively replace the offline DNS configuration in one commit.
+
+        The full replacement (zone, bindings and aliases together) is
+        validated before the transaction starts.  Inside one
+        ``BEGIN IMMEDIATE`` transaction the clock is checked for backward
+        motion, expired local leases and external facts are reaped, the
+        configuration storage is created on first use and atomically replaced
+        afterwards, the final mirror is compiled against the final active
+        leases, the clock advances and a single post-state history event is
+        appended when history is enabled.  Any conflict, dangling chain,
+        cycle or SQL failure rolls back leases, external facts, clock,
+        history sequence and the DNS configuration together.
+        """
+        now=number(now,0,10**12)
+        # Pure validation: nothing is created or migrated for a bad request.
+        normalized_zone,normalized_bindings,normalized_aliases=validate_config(zone,bindings,aliases)
+        try:
+            self.db.execute('BEGIN IMMEDIATE')
+            row=self.db.execute('SELECT cidr,clock FROM metadata WHERE id=1').fetchone()
+            if not row:raise ValueError('initialize pool first')
+            cidr,clock=row
+            if now<clock:raise ValueError('clock cannot move backward')
+            history=self._coverage() is not None
+            before=self._leases_by_address() if history else None
+            self.db.execute('DELETE FROM leases WHERE expires<=?',(now,))
+            if self._external_table_exists():
+                self.db.execute('DELETE FROM external_dhcp_claims WHERE expires<=?',(now,))
+            for statement in DNS_TABLES:self.db.execute(statement)
+            self.db.execute('DELETE FROM dns_bindings')
+            self.db.execute('DELETE FROM dns_aliases')
+            self.db.execute('DELETE FROM dns_meta')
+            self.db.execute('INSERT INTO dns_meta VALUES (1,?)',(normalized_zone,))
+            for client,name,reverse in normalized_bindings:
+                self.db.execute('INSERT INTO dns_bindings VALUES(?,?,?)',(client,name,1 if reverse else 0))
+            for owner,target in normalized_aliases:
+                self.db.execute('INSERT INTO dns_aliases VALUES(?,?)',(owner,target))
+            records=self._dns_guard(now)
+            self.db.execute('UPDATE metadata SET clock=? WHERE id=1',(now,))
+            if history:self._append_history(now,before)
+            self.db.commit()
+            return {'cidr':cidr,'clock':now,'zone':normalized_zone,'records':records}
+        except Exception:
+            self.db.rollback();raise
+    def dns_snapshot(self):
+        """Compile the mirror under one read-only, read-consistent snapshot.
+
+        Reads the clock, zone, configuration and active leases in a single
+        read transaction so all three always come from the same commit.  It
+        never cleans up, never writes a table and never advances the clock.
+        A pool without a DNS configuration fails without creating one.
+        """
+        connection,owned=self._read_connection()
+        try:
+            connection.execute('BEGIN')
+            row=connection.execute('SELECT cidr,clock FROM metadata WHERE id=1').fetchone()
+            if not row:raise ValueError('initialize pool first')
+            cidr,clock=row
+            exists=connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dns_meta'").fetchone()
+            if exists is None or connection.execute(
+                    'SELECT 1 FROM dns_meta WHERE id=1').fetchone() is None:
+                raise DnsError('DNS not configured')
+            zone=connection.execute('SELECT zone FROM dns_meta WHERE id=1').fetchone()[0]
+            db_bindings=[(client,name,bool(reverse)) for client,name,reverse
+                         in connection.execute('SELECT client,name,reverse FROM dns_bindings ORDER BY rowid')]
+            db_aliases=list(connection.execute('SELECT owner,target FROM dns_aliases ORDER BY rowid'))
+            active={client:(address,expires)
+                    for client,address,expires in connection.execute(
+                        'SELECT client,address,expires FROM leases WHERE expires>? ORDER BY client',(clock,))}
+            records=compile_mirror(zone,db_bindings,db_aliases,active,clock)
+            connection.commit()
+            return {'cidr':cidr,'clock':clock,'zone':zone,'records':records}
+        except Exception:
+            connection.rollback();raise
+        finally:
+            if owned:connection.close()
     def attribute_flows(self,flows):
         """Attribute sampled flows to historical holders in a read snapshot.
 

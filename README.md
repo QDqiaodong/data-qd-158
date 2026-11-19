@@ -99,3 +99,21 @@ flows.json严格为`{"flows":[{"id":"f1","address":"192.0.2.1","start":0,"end":1
 实现以不相交的符号盒子（源/目标/协议/端口四元区间）表示包域，盒子相减只在边界切割，计数全部是区间宽度的精确整数乘积，**不枚举任何地址、端口或数据包**：每版逐规则报告`raw_packets`（原始匹配）、`effective_packets`（扣除更早规则覆盖后的实际首命中）与`shadowed_packets`（两者差），默认项报告整域未命中数；两版互斥首命中分区两两求交，给出每个非空`(before_rule,after_rule)`组合的精确`packets`和该组合按`(src数值,dst数值,tcp先于udp,port)`字典序最小的`witness`，组合互斥且恰好覆盖整域一次。据此汇总deny→allow的`newly_allowed`、allow→deny的`newly_denied`（同action改id、乃至完全相同的非空组合都保留），而不是只比较两版allow总量。
 
 报告严格含`cidr`、`clock`、`total_packets`、`newly_allowed`、`newly_denied`、`before`、`after`、`transitions`，全部整数精确计算、无浮点；CLI另加`source_sha256`，stdout与输出文件内容相同并原子发布，出错退出2、只写stderr、保留旧报告，拒绝输入/输出/数据库路径冲突及三者的符号链接，缺失数据库失败且不创建空库。分析只在一个只读一致快照读取cidr/clock，不推进clock、不清理到期事实、不写任何表，无历史表的旧池同样可审计。`fixtures/acl-diff.json`为/32池的B/D/A验收样例；详见[数据契约](docs/contract.md)。
+
+## 持久离线DNS数据镜像
+
+为地址运营增加一份持久、离线的DNS结构化镜像：把client绑定到区内名称（可选reverse PTR），并用CNAME别名表达有向关系。全程只读文件与SQLite，不访问任何DNS服务、不监听端口、不产生wire格式或zone文件：
+
+```sh
+.venv/bin/ipv4-admin --db run/pool.sqlite dns-config --source dns.json
+.venv/bin/ipv4-admin --db run/pool.sqlite dns-snapshot --output dns-snapshot.json
+```
+
+`dns.json`严格为`{"now":整数,"zone":名称,"bindings":[{"client","name","reverse"}],"aliases":[{"name","target"}]}`（≤8MB、四字段必填、拒绝额外字段/重复键/非有限数）。bindings至多128项且client互异，aliases至多2048项且规范化后owner互异，两数组均可空；alias owner不得是zone顶点。名称为完整ASCII hostname（可有可无一个末尾点），规范化为小写、恰一个末尾点，按完整label边界限定在区内，拒绝Unicode、下划线、空label、非法连字符与长度越界；client沿用ident精确相等，不做大小写转换。
+
+镜像始终**即时派生**而不物化：DNS表只存配置，记录由“所用now的最终活跃租约（`expires>now`）+ 生效配置”编译。同名多个活跃client生成一个多值A RRset（地址按数值排序），A的TTL取贡献租约`expires-now`的最小值；`reverse=true`的每个活跃地址另生成指向绑定名称的PTR，TTL取该地址自身的剩余时间；CNAME的values只含直接target，每条链必须无环且终止于非空A RRset，每层TTL都等于终端A的TTL，CNAME owner不得同时有活跃A。环（含自环）、悬空链、A/CNAME同名冲突确定性拒绝，链遍历为迭代实现，支持1500层链而不依赖递归深度。
+
+`dns-config`是整份配置的权威替换，在单个`BEGIN IMMEDIATE`内拒绝时钟倒退、清理到期事实、安装配置、编译最终镜像、推进clock，并在已启用历史时追加一条原post-state事件；一旦已配置，`acquire/release/list/reconcile/import_dhcp`都在各自原事务内用同一编译器校验最终镜像，任何冲突、悬空、环或SQL失败连同租约、外部事实、clock、历史seq和DNS配置整体回滚，绝不先提交租约再修DNS，原算法、分配目标与返回字段不变。`dns-snapshot`在单个只读一致快照编译所读clock下的镜像，不清理、不写表、不推进clock，clock/zone/records必来自同一提交；未配置时明确失败且不建表，旧库旧入口行为完全不变。
+
+成功报告严格为`{cidr,clock,zone,records}`，records每项为`{name,type,ttl,values}`并按`(name,type)`排序，空镜像`records=[]`；API无摘要，CLI的`dns-config`另加源文件原字节`source_sha256`，`dns-snapshot`把同一报告原子写入`--output`并在stdout打印。出错退出2、只写stderr、保留旧报告；拒绝源/输出与数据库同路径、硬链接及任何符号链接，缺失数据库失败且不创建空库。详见[数据契约](docs/contract.md)。
+

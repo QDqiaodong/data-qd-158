@@ -87,3 +87,28 @@ JSON入口是隔离临时数据库中的可重现操作演示，输入cidr及ope
 **转移与放行变化**：`transitions`每项严格为`{before_rule,after_rule,before_action,after_action,packets,witness}`，规则字段为id或默认null，action从对应规则或默认项确定；只输出`packets>0`的组合，每个组合只出现一次，按`before_rule`再`after_rule`排序，各维按Python字符串顺序、null排在全部字符串之后。同action但首命中id改变、乃至id与action完全相同的组合都保留。对`before_rule`或`after_rule`分别做边缘汇总，恰等于对应版的`effective_packets`。由这些组合汇总deny→allow的`newly_allowed`与allow→deny的`newly_denied`。`witness`为`{src,dst,protocol,port}`，src/dst为规范IPv4字符串、protocol只能为tcp或udp、port为整数，必须真实属于该组合并满足题述最小包序。全部数值用整数精确计算与JSON序列化，无浮点近似。
 
 **事务与CLI**：分析在单个只读快照读取cidr/clock，输入不合法、池未初始化、计算或发布失败都不改变业务数据库。CLI在API相同报告上增加`source_sha256`（输入原字节SHA256），以现有原子发布方式保存完整JSON并在stdout输出相同报告，成功退出0；错误退出2且仅向stderr说明原因，不打印成功JSON并保留已有输出。输入、输出、数据库须为不同路径，三者的符号链接均拒绝；缺失数据库失败且不创建空库。
+
+## 持久离线DNS数据镜像（dns-config / dns-snapshot）
+
+`Pool.configure_dns(now, zone, bindings, aliases)` / `ipv4-admin --db DB dns-config --source FILE` 安装或整份替换一份持久的离线DNS配置，`Pool.dns_snapshot()` / `ipv4-admin --db DB dns-snapshot --output FILE` 在只读一致快照中编译结构化镜像。仅用Python标准库与SQLite，不访问任何DNS服务、不监听端口、不产生wire格式/zone文件/SOA/NS/DNSSEC；镜像是供下游消费的记录集合。
+
+**派生而非物化**：DNS表只持久化配置（zone、bindings、aliases），记录本身始终在每次需要时由“所用now的最终活跃租约 + 本次生效配置”即时派生，因此不存在会过期的物化记录行。所有写入口（`acquire/release/list/reconcile/import_dhcp`及再次`dns-config`）都在各自原`BEGIN IMMEDIATE`事务内、对最终状态调用与快照**同一个**编译器做完整性校验，校验不过则整个事务回滚；快照只读取并编译，不清理、不写表、不推进clock。
+
+**名称校验与规范化**：zone及bindings/aliases中的名称必须是完整ASCII hostname，可有可无一个末尾点；规范化为小写并恰有一个末尾点。去掉可选末尾点后总长1..253字节，每label为1..63字节的ASCII字母、数字或连字符，首尾必须是字母或数字；拒绝Unicode/IDNA形式的非ASCII名称、下划线、空label、非法连字符、前后空白、连续或多个末尾点、长度越界。bindings的`name`、alias的`name`及`target`必须等于zone本身或按完整label边界（`.zone.`）结尾于zone，字符串后缀伪装的区外名称（如zone为`lab.test`时的`notlab.test`）拒绝。client身份沿用ident精确字符串相等，不做DNS名称或大小写转换。`reverse`只接受真实bool。
+
+**配置文件与API入参**：文件顶层严格为`{"now":整数,"zone":名称,"bindings":[{"client":标识,"name":名称,"reverse":布尔值},...],"aliases":[{"name":名称,"target":名称},...]}`，四字段必填、拒绝额外字段，沿用8,000,000字节严格JSON（重复键、非有限数、错类型拒绝）；API四参对应顶层四值，aliases中的`name`即CNAME owner。`now`为0..10^12非布尔整数；bindings至多128项且client互异（即使binding完全相同，重复client也拒绝），aliases至多2048项且规范化后owner互异（无论target是否相同）；两数组均允许为空。alias owner不得等于zone顶点。bindings可引用尚无租约的休眠client，同一name可绑定多个不同client；不要求每个已有client都有binding，未绑定client不贡献任何记录。
+
+**记录语义（活跃仅按最终租约`expires>所用now`判断）**：
+- *A*：每个被binding引用且有活跃租约的名称生成一个多值A RRset，values为全部贡献租约地址的规范IPv4字符串并按地址数值排序；TTL取所有贡献租约`expires-now`的最小值。同一client只绑定一个name。
+- *PTR*：`reverse=true`的活跃租约，每个贡献地址生成一个PTR RRset，owner为四个IPv4十进制字节逆序加`.in-addr.arpa.`（如192.0.2.1→`1.2.0.192.in-addr.arpa.`），values为单个规范绑定名称，TTL为该地址自身的`expires-now`（不取同名A的最短TTL）；`reverse=false`与CNAME均不产生PTR。
+- *CNAME*：aliases是区内有向关系，owner唯一、每项一个直接target（values只含直接target，不展开为终端名或IP）。每条链必须无环且终止于非空A RRset；CNAME owner不得同时具有活跃A（休眠binding可与CNAME同名，但其client一旦取得地址即重新检查冲突）。多层别名每层TTL均取最终非空A RRset的TTL，因此缩短/延长租约会沿整条依赖链同步改变TTL。环（含自环）与悬空链确定性拒绝；链遍历为带显式visited集合的迭代算法，支持1500层链/2048个别名而不依赖Python递归深度。
+- 外部DHCP宣告不是本地client，不直接生成任何DNS记录；它对旧分配的限制保持原义。
+
+**事务与原子性**：`dns-config`是整份配置的权威替换（zone、bindings、aliases一起替换，不保留已删除部分；空bindings加空aliases是合法配置）。它在同一`BEGIN IMMEDIATE`事务内拒绝时间倒退、清理到期本地/外部事实、首次建立DNS配置存储（之后整份替换）、编译最终镜像、推进clock，并在已启用归属历史时于同一事务追加一条原post-state历史事件（不替旧池启用历史，不重复调用旧list推进时间；相同配置重复成功也恰追加一次历史）。任何冲突、悬空链、环或SQL失败都回滚租约、外部事实、clock、历史seq与DNS配置，不能先提交租约再修DNS。原`acquire`（新地址与续租）、`reconcile`（权威集合及两级全局目标）、`import_dhcp`（外部占用身份）的算法与返回JSON字段保持原样，DNS守卫只对它们原本可成功的最终结果作完整性判断，不绕开原分配目标另找DNS可行解，也不额外附加DNS字段。
+
+**启用边界与旧库兼容**：仅`dns-config`可首次建立DNS配置存储；未配置的旧库/新库上，旧入口的行为、结果、外部事实与历史契约保持原样，旧写入口不得仅因升级而创建DNS表。只有确实不存在DNS配置表/配置行时才视为未启用；损坏表或其他SQL错误必须传播。`dns-snapshot`在未配置时明确失败且不偷偷建立配置。无归属历史的旧池可以配置DNS但仍无历史；重复`init`与`history-enable`不改DNS配置、不重写镜像或clock。
+
+**快照一致性**：`dns_snapshot`在单个只读事务内读取cidr、clock、zone、配置与活跃租约，因此clock、zone与records必来自同一提交；两个连接的配置更换与租约操作由SQLite按单一提交顺序串行生效，快照只能读到完整提交，读不到半份配置或已失效的旧记录。只读方法不调用会清理的旧list，也不在查询中迁移表；快照计算/发布失败保留已有报告且业务数据库不变（不要求跨SQLite与输出文件的断电原子性）。
+
+**返回与CLI**：`configure_dns`与`dns_snapshot`成功返回结构严格相同：`{cidr,clock,zone,records}`；`records`每项严格为`{name,type,ttl,values}`，type为`A`、`CNAME`或`PTR`，ttl为正整数，按`(name,type)`的Python字符串顺序排序，同一`(name,type)`只出现一项，空镜像`records=[]`。API不含`source_sha256`；`dns-config`只在其成功stdout报告上额外增加`source_sha256`（源文件原字节摘要），`dns-snapshot`无输入文件、不加源摘要，并以现有原子发布方式把与API相同的报告保存到`--output`且在stdout打印相同内容。成功退出0；错误退出2、只向stderr说明原因且不输出成功JSON。dns-config源文件与数据库不得同一路径或硬链接至同一文件，dns-snapshot输出与数据库亦然；数据库、源文件、输出本身的符号链接均拒绝；缺失/未初始化数据库失败且不创建空数据库。
+
